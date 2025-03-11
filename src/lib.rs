@@ -68,31 +68,35 @@ Further metrics can be tracked by registering them with the registry of the
 [`PrometheusMetrics`] instance:
 
 ```rust
-use once_cell::sync::Lazy;
-use rocket::{get, launch, routes};
+use rocket::{get, launch, routes, State};
 use rocket_prometheus::{
-    prometheus::{opts, IntCounterVec},
+    prometheus_client::{metrics::{counter::Counter, family::Family}, encoding::EncodeLabelSet},
     PrometheusMetrics,
 };
+type NameCounter = Family<NameLabel, Counter>;
 
-static NAME_COUNTER: Lazy<IntCounterVec> = Lazy::new(|| {
-    IntCounterVec::new(opts!("name_counter", "Count of names"), &["name"])
-        .expect("Could not create NAME_COUNTER")
-});
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct NameLabel {
+    name: String,
+}
 
 #[get("/hello/<name>")]
-pub fn hello(name: &str) -> String {
-    NAME_COUNTER.with_label_values(&[name]).inc();
+pub fn hello(name: &str, name_counter: &State<NameCounter>) -> String {
+    name_counter.get_or_create(&NameLabel { name: name.to_string() }).inc();
     format!("Hello, {}!", name)
 }
 
 #[launch]
-fn launch() -> _ {
+async fn launch() -> _ {
     let prometheus = PrometheusMetrics::new();
-    prometheus
-        .registry()
-        .register(Box::new(NAME_COUNTER.clone()))
-        .unwrap();
+
+    let name_counter = NameCounter::default();
+
+    {
+        let mut registry = prometheus.registry().lock().await;
+        registry.register("name_counter", "Count of names", name_counter.clone());
+    }
+
     rocket::build()
         .attach(prometheus.clone())
         .mount("/", routes![hello])
@@ -104,20 +108,25 @@ fn launch() -> _ {
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
 
-use std::{env, time::Instant};
+use std::{env, sync::Arc, time::Instant};
 
-use prometheus::{opts, Encoder, HistogramVec, IntCounterVec, Registry, TextEncoder};
+use prometheus_client::{
+    encoding::{text::encode, EncodeLabelSet},
+    metrics::{counter::Counter, family::Family, histogram::Histogram},
+    registry::Registry,
+};
 use rocket::{
     fairing::{Fairing, Info, Kind},
     http::{ContentType, Method},
     route::{Handler, Outcome},
     Data, Request, Response, Route,
 };
+use tokio::sync::Mutex;
 
-/// Re-export Prometheus so users can use it without having to explicitly
+/// Re-export Prometheus client so users can use it without having to explicitly
 /// add a specific version to their dependencies, which can result in
 /// mysterious compiler error messages.
-pub use prometheus;
+pub use prometheus_client;
 
 /// Environment variable used to configure the namespace of metrics exposed
 /// by `PrometheusMetrics`.
@@ -180,8 +189,8 @@ const NAMESPACE_ENV_VAR: &str = "ROCKET_PROMETHEUS_NAMESPACE";
 /// ```
 pub struct PrometheusMetrics {
     // Standard metrics tracked by the fairing.
-    http_requests_total: IntCounterVec,
-    http_requests_duration_seconds: HistogramVec,
+    http_requests_total: Family<Labels, Counter>,
+    http_requests_duration_seconds: Family<Labels, Histogram>,
 
     // The registry used by the fairing for Rocket metrics.
     //
@@ -192,22 +201,29 @@ pub struct PrometheusMetrics {
     // Previously the fairing tried to register the internal metrics on the `extra_registry`,
     // which caused conflicts if the same registry was passed twice. This is now avoided
     // by using an internal registry for those metrics.
-    rocket_registry: Registry,
+    rocket_registry: Arc<Mutex<Registry>>,
 
     // The registry used by the fairing for custom metrics.
     //
     // See `rocket_registry` for details on why these metrics are stored on a separate registry.
-    custom_registry: Registry,
+    custom_registry: Arc<Mutex<Registry>>,
 
     // Option for request filtering. If it contains a function, said function should return true when
     // the current request should be considered in metrics.
     request_filter: Option<for<'a> fn(&'a Request<'_>) -> bool>,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct Labels {
+    endpoint: String,
+    status: String,
+    method: String,
+}
+
 impl PrometheusMetrics {
     /// Create a new [`PrometheusMetrics`].
     pub fn new() -> Self {
-        Self::with_registry(Registry::new())
+        Self::with_registry(Arc::new(Mutex::new(Registry::default())))
     }
 
     /// Create a new [`PrometheusMetrics`] with a custom [`Registry`].
@@ -215,49 +231,39 @@ impl PrometheusMetrics {
     // - the two metrics can't fail to be created (their config is valid)
     // - registering the metrics can't fail (the registry is new, so there is no chance of metric duplication)
     #[allow(clippy::missing_panics_doc)]
-    pub fn with_registry(registry: Registry) -> Self {
-        let rocket_registry = Registry::new();
+    pub fn with_registry(registry: Arc<Mutex<Registry>>) -> Self {
         let namespace = env::var(NAMESPACE_ENV_VAR).unwrap_or_else(|_| "rocket".into());
+        let mut rocket_registry = Registry::with_prefix(namespace);
 
-        let http_requests_total_opts =
-            opts!("http_requests_total", "Total number of HTTP requests")
-                .namespace(namespace.clone());
-        let http_requests_total =
-            IntCounterVec::new(http_requests_total_opts, &["endpoint", "method", "status"])
-                .unwrap();
-        let http_requests_duration_seconds_opts = opts!(
+        let http_requests_total = Family::<Labels, Counter>::default();
+        rocket_registry.register(
+            "http_requests_total",
+            "Total number of HTTP requests",
+            http_requests_total.clone(),
+        );
+
+        let http_requests_duration_seconds =
+            Family::<Labels, Histogram>::new_with_constructor(|| {
+                // based on https://github.com/prometheus/client_rust/blob/ab152ee915698f83ae5b7ac5e4bee104678b70b1/src/metrics/histogram.rs#L28C5-L30C7
+                let custom_buckets = [
+                    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+                ];
+                Histogram::new(custom_buckets)
+            });
+
+        rocket_registry.register(
             "http_requests_duration_seconds",
-            "HTTP request duration in seconds for all requests"
-        )
-        .namespace(namespace);
-        let http_requests_duration_seconds = HistogramVec::new(
-            http_requests_duration_seconds_opts.into(),
-            &["endpoint", "method", "status"],
-        )
-        .unwrap();
-
-        rocket_registry
-            .register(Box::new(http_requests_total.clone()))
-            .unwrap();
-        rocket_registry
-            .register(Box::new(http_requests_duration_seconds.clone()))
-            .unwrap();
+            "HTTP request duration in seconds for all requests",
+            http_requests_duration_seconds.clone(),
+        );
 
         Self {
             http_requests_total,
             http_requests_duration_seconds,
-            rocket_registry,
+            rocket_registry: Arc::new(Mutex::new(rocket_registry)),
             custom_registry: registry,
             request_filter: None,
         }
-    }
-
-    /// Create a new [`PrometheusMetrics`] using the default Prometheus [`Registry`].
-    ///
-    /// This will cause the fairing to include metrics created by the various
-    /// `prometheus` macros, e.g.  `register_int_counter`.
-    pub fn with_default_registry() -> Self {
-        Self::with_registry(prometheus::default_registry().clone())
     }
 
     /// Get the registry used by this fairing to track additional metrics.
@@ -268,33 +274,9 @@ impl PrometheusMetrics {
     ///
     /// Note that the `http_requests_total` and `http_requests_duration_seconds` metrics
     /// are _not_ included in this registry.
-    ///
-    /// ```rust
-    /// use once_cell::sync::Lazy;
-    /// use prometheus::{opts, IntCounter};
-    /// use rocket_prometheus::PrometheusMetrics;
-    ///
-    /// static MY_COUNTER: Lazy<IntCounter> = Lazy::new(|| {
-    ///     IntCounter::new("my_counter", "A counter I use a lot")
-    ///         .expect("Could not create counter")
-    /// });
-    ///
-    /// let prometheus = PrometheusMetrics::new();
-    /// prometheus.registry().register(Box::new(MY_COUNTER.clone()));
-    /// ```
     #[must_use]
-    pub const fn registry(&self) -> &Registry {
+    pub const fn registry(&self) -> &Arc<Mutex<Registry>> {
         &self.custom_registry
-    }
-
-    /// Get the `http_requests_total` metric.
-    pub fn http_requests_total(&self) -> &IntCounterVec {
-        &self.http_requests_total
-    }
-
-    /// Get the `http_requests_duration_seconds` metric.
-    pub fn http_requests_duration_seconds(&self) -> &HistogramVec {
-        &self.http_requests_duration_seconds
     }
 
     /// Set a filter for which request should be considered in metrics. The filter function should
@@ -460,17 +442,19 @@ impl Fairing for PrometheusMetrics {
         }
 
         let endpoint = req.route().unwrap().uri.inner().to_string();
-        let method = req.method().as_str();
         let status = StatusCode::from(response.status().code);
-        self.http_requests_total
-            .with_label_values(&[endpoint.as_str(), method, status.as_str()])
-            .inc();
+        let labels = Labels {
+            endpoint,
+            method: req.method().to_string(),
+            status: status.as_str().into(),
+        };
+        self.http_requests_total.get_or_create(&labels).inc();
 
         let start_time = req.local_cache(|| TimerStart(None));
         if let Some(duration) = start_time.0.map(|st| st.elapsed()) {
             let duration_secs = duration.as_secs_f64();
             self.http_requests_duration_seconds
-                .with_label_values(&[endpoint.as_str(), method, status.as_str()])
+                .get_or_create(&labels)
                 .observe(duration_secs);
         }
     }
@@ -480,21 +464,19 @@ impl Fairing for PrometheusMetrics {
 impl Handler for PrometheusMetrics {
     async fn handle<'r>(&self, req: &'r Request<'_>, _: Data<'r>) -> Outcome<'r> {
         // Gather the metrics.
-        let mut buffer = vec![];
-        let encoder = TextEncoder::new();
-        encoder
-            .encode(&self.custom_registry.gather(), &mut buffer)
-            .unwrap();
-        encoder
-            .encode(&self.rocket_registry.gather(), &mut buffer)
-            .unwrap();
-        let body = String::from_utf8(buffer).unwrap();
+        let mut buffer = String::new();
+        let custom_registry = self.custom_registry.lock().await;
+        encode(&mut buffer, &custom_registry).unwrap();
+
+        let rocket_registry = self.rocket_registry.lock().await;
+        encode(&mut buffer, &rocket_registry).unwrap();
+
         Outcome::from(
             req,
             (
                 ContentType::new("text", "plain")
                     .with_params([("version", "0.0.4"), ("charset", "utf-8")]),
-                body,
+                buffer,
             ),
         )
     }
@@ -512,7 +494,7 @@ mod test {
 
     #[test]
     fn test_multiple_instantiations() {
-        let _pm1 = PrometheusMetrics::with_default_registry();
-        let _pm2 = PrometheusMetrics::with_default_registry();
+        let _pm1 = PrometheusMetrics::new();
+        let _pm2 = PrometheusMetrics::new();
     }
 }

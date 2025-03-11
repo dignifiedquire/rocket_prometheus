@@ -1,28 +1,36 @@
 #[macro_use]
 extern crate rocket;
 
-use once_cell::sync::Lazy;
-use prometheus::{opts, IntCounterVec};
+use prometheus_client::encoding::EncodeLabelSet;
+use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
 use rocket_prometheus::PrometheusMetrics;
 
-static NAME_COUNTER: Lazy<IntCounterVec> = Lazy::new(|| {
-    IntCounterVec::new(opts!("name_counter", "Count of names"), &["name"])
-        .expect("Could not create lazy IntCounterVec")
-});
+type NameCounter = Family<NameLabel, Counter>;
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct NameLabel {
+    name: String,
+}
 
 mod routes {
     use rocket::serde::json::Json;
+    use rocket::State;
     use serde::Deserialize;
 
-    use super::NAME_COUNTER;
+    use super::{NameCounter, NameLabel};
 
     #[get("/hello/<name>?<caps>")]
-    pub fn hello(name: &str, caps: Option<bool>) -> String {
+    pub fn hello(name: &str, caps: Option<bool>, name_counter: &State<NameCounter>) -> String {
         let name = caps
             .unwrap_or_default()
             .then(|| name.to_uppercase())
             .unwrap_or_else(|| name.to_string());
-        NAME_COUNTER.with_label_values(&[&name]).inc();
+
+        name_counter
+            .get_or_create(&NameLabel { name: name.clone() })
+            .inc();
+
         format!("Hello, {}!", name)
     }
 
@@ -32,25 +40,38 @@ mod routes {
     }
 
     #[post("/hello/<name>?<caps>", format = "json", data = "<person>")]
-    pub fn hello_post(name: String, person: Json<Person>, caps: Option<bool>) -> String {
+    pub fn hello_post(
+        name: String,
+        person: Json<Person>,
+        caps: Option<bool>,
+        name_counter: &State<NameCounter>,
+    ) -> String {
         let name = caps
             .unwrap_or_default()
             .then(|| name.to_uppercase())
             .unwrap_or_else(|| name.to_string());
-        NAME_COUNTER.with_label_values(&[&name]).inc();
+        name_counter
+            .get_or_create(&NameLabel { name: name.clone() })
+            .inc();
+
         format!("Hello, {} year old named {}!", person.age, name)
     }
 }
 
 #[launch]
-fn rocket() -> _ {
+async fn rocket() -> _ {
     let prometheus = PrometheusMetrics::new();
-    prometheus
-        .registry()
-        .register(Box::new(NAME_COUNTER.clone()))
-        .unwrap();
+
+    let name_counter = NameCounter::default();
+
+    {
+        let mut registry = prometheus.registry().lock().await;
+        registry.register("name_counter", "Count of names", name_counter.clone());
+    }
+
     rocket::build()
         .attach(prometheus.clone())
+        .manage(name_counter)
         .mount("/", routes![routes::hello, routes::hello_post])
         .mount("/metrics", prometheus)
 }
