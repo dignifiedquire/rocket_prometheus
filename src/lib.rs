@@ -459,18 +459,18 @@ impl Fairing for PrometheusMetrics {
             }
         }
 
-        let endpoint = req.route().unwrap().uri.as_str();
+        let endpoint = req.route().unwrap().uri.inner().to_string();
         let method = req.method().as_str();
         let status = StatusCode::from(response.status().code);
         self.http_requests_total
-            .with_label_values(&[endpoint, method, status.as_str()])
+            .with_label_values(&[endpoint.as_str(), method, status.as_str()])
             .inc();
 
         let start_time = req.local_cache(|| TimerStart(None));
         if let Some(duration) = start_time.0.map(|st| st.elapsed()) {
             let duration_secs = duration.as_secs_f64();
             self.http_requests_duration_seconds
-                .with_label_values(&[endpoint, method, status.as_str()])
+                .with_label_values(&[endpoint.as_str(), method, status.as_str()])
                 .observe(duration_secs);
         }
     }
